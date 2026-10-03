@@ -1,0 +1,105 @@
+name: Build and publish tinyproxy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: tinyproxy-publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/silicat/tinyproxy
+  BUILD_TAG: build-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: 读取仓库
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: 构建 amd64 镜像
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker build --pull --no-cache --platform linux/amd64 \
+            -t "$IMAGE:latest" -t "$IMAGE:$BUILD_TAG" .
+          docker run --rm --network none "$IMAGE:latest" -v
+
+      - name: 测试配置挂载和 HTTP 代理转发
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > "$RUNNER_TEMP/tinyproxy-test.conf" <<'EOF'
+          Port 8888
+          Listen 0.0.0.0
+          Timeout 60
+          MaxClients 16
+          Allow 0.0.0.0/0
+          LogLevel Info
+          EOF
+          chmod 644 "$RUNNER_TEMP/tinyproxy-test.conf"
+          cat "$RUNNER_TEMP/tinyproxy-test.conf"
+
+          docker network create tinyproxy-ci
+          docker run -d --name tinyproxy-ci-origin \
+            --network tinyproxy-ci nginx:stable-alpine
+          docker run -d --name tinyproxy-ci-proxy \
+            --network tinyproxy-ci \
+            -p 127.0.0.1:8888:8888 \
+            -v "$RUNNER_TEMP/tinyproxy-test.conf:/etc/tinyproxy/tinyproxy.conf:ro" \
+            "$IMAGE:latest"
+
+          for attempt in $(seq 1 15); do
+            echo "[测试] HTTP 代理转发，第 $attempt 次"
+            if curl --noproxy '' --proxy http://127.0.0.1:8888 \
+              --connect-timeout 2 --max-time 5 --fail --silent --show-error \
+              http://tinyproxy-ci-origin/ \
+              -o "$RUNNER_TEMP/tinyproxy-response.html"; then
+              cat "$RUNNER_TEMP/tinyproxy-response.html"
+              grep -Fq 'Welcome to nginx!' "$RUNNER_TEMP/tinyproxy-response.html"
+              echo '[通过] 配置挂载、代理启动、容器内域名解析和 HTTP 转发'
+              exit 0
+            fi
+            sleep 1
+          done
+          echo '[错误] HTTP 代理转发测试失败' >&2
+          exit 1
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 发布已测试的镜像
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker push "$IMAGE:$BUILD_TAG"
+          docker push "$IMAGE:latest"
+
+      - name: 输出日志并清理测试对象
+        if: always()
+        shell: bash
+        run: |
+          set -x
+          docker logs --tail 120 tinyproxy-ci-proxy || true
+          docker logs --tail 120 tinyproxy-ci-origin || true
+          docker rm -f tinyproxy-ci-proxy tinyproxy-ci-origin || true
+          docker network rm tinyproxy-ci || true
+          rm -f "$RUNNER_TEMP/tinyproxy-test.conf" "$RUNNER_TEMP/tinyproxy-response.html"
